@@ -8,6 +8,7 @@ import { pool } from './db.js';
 import { clearSessionCookie, createOtpChallenge, findSessionUser, requestLogin, requestSignup, SESSION_COOKIE, setSessionCookie, verifyOtp } from './auth.js';
 import { decryptAccountNumber, encryptAccountNumber, accountNumberHash, generateAccountNumber } from './security.js';
 import { sendOnboardingEmail } from './mailer.js';
+import { scoreTransactionBehavior } from './fraudDetection.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -98,8 +99,8 @@ function publicRecipient(row) {
   };
 }
 
-function publicTransaction(row) {
-  return {
+function publicTransaction(row, includeRisk = false) {
+  const transaction = {
     id: row.transaction_id,
     senderId: row.sender_account_id,
     receiverId: row.receiver_account_id,
@@ -108,9 +109,13 @@ function publicTransaction(row) {
     status: row.status === 'pending_review' ? 'Review' : row.status === 'completed' ? 'Completed' : 'Declined',
     createdAt: row.created_at,
     reviewedAt: row.reviewed_at,
-    riskScore: row.risk_score ?? 0,
-    riskReason: row.flag_reason ?? '',
   };
+  if (includeRisk) {
+    transaction.riskScore = row.risk_score ?? 0;
+    transaction.riskReason = row.flag_reason ?? '';
+    transaction.riskSummary = row.ai_summary ?? '';
+  }
+  return transaction;
 }
 
 function accountSelect(where = '') {
@@ -183,8 +188,7 @@ app.get('/api/customer/overview', requireAuth, loadUser, requireRole('customer')
   if (!account) return response.status(404).json({ error: 'No active account is associated with this user.' });
   const [transactionsResult, recipientsResult] = await Promise.all([
     pool.query(
-      `SELECT t.*, f.risk_score, f.flag_reason FROM transactions t
-       LEFT JOIN fraud_logs f ON f.transaction_id = t.transaction_id
+      `SELECT t.* FROM transactions t
        WHERE t.sender_account_id = $1 OR t.receiver_account_id = $1 ORDER BY t.created_at DESC`,
       [account.account_id],
     ),
@@ -225,7 +229,7 @@ app.get('/api/admin/dashboard', requireAuth, loadUser, requireRole('admin'), asy
   const [accountsResult, transactionsResult, auditResult] = await Promise.all([
     pool.query(accountSelect('ORDER BY a.created_at DESC')),
     pool.query(
-      `SELECT t.*, f.risk_score, f.flag_reason FROM transactions t
+      `SELECT t.*, f.risk_score, f.flag_reason, f.ai_summary FROM transactions t
        LEFT JOIN fraud_logs f ON f.transaction_id = t.transaction_id ORDER BY t.created_at DESC`,
     ),
     pool.query(
@@ -237,7 +241,7 @@ app.get('/api/admin/dashboard', requireAuth, loadUser, requireRole('admin'), asy
   ]);
   response.json({
     customers: accountsResult.rows.map(publicAccount),
-    transactions: transactionsResult.rows.map(publicTransaction),
+    transactions: transactionsResult.rows.map((row) => publicTransaction(row, true)),
     auditLogs: auditResult.rows,
   });
 }));
@@ -513,15 +517,29 @@ app.post('/api/transactions', requireAuth, loadUser, requireRole('customer'), as
       error.status = 409;
       throw error;
     }
-    const recent = await client.query(
-      `SELECT count(*)::int AS count FROM transactions
-       WHERE sender_account_id = $1 AND created_at > now() - interval '5 minutes'`,
-      [sender.account_id],
-    );
-    const recentOutgoing = recent.rows[0].count;
-    const riskScore = Math.min(98, (amount >= 5000 ? 82 : amount >= 2000 ? 48 : 12) + (recentOutgoing >= 2 ? 18 : 0));
-    const mustReview = riskScore >= 75;
-    const flagReason = riskScore >= 75 ? (amount >= 5000 ? 'Amount exceeds the review threshold' : 'Unusual transaction frequency') : '';
+    const [recent, history] = await Promise.all([
+      client.query(
+        `SELECT count(*)::int AS count FROM transactions
+         WHERE sender_account_id = $1
+           AND status IN ('completed', 'pending_review')
+           AND created_at > now() - interval '5 minutes'`,
+        [sender.account_id],
+      ),
+      client.query(
+        `SELECT amount, receiver_account_id FROM transactions
+         WHERE sender_account_id = $1 AND transaction_type = 'transfer' AND status = 'completed'
+         ORDER BY created_at DESC LIMIT 50`,
+        [sender.account_id],
+      ),
+    ]);
+    const analysis = scoreTransactionBehavior({
+      amount,
+      availableBalance: Number(sender.balance),
+      recentOutgoingCount: recent.rows[0].count,
+      priorTransfers: history.rows,
+      recipientAccountId: recipient.account_id,
+    });
+    const mustReview = analysis.flagged;
     const transactionResult = await client.query(
       `INSERT INTO transactions (sender_account_id, receiver_account_id, transaction_type, amount, status, created_by, idempotency_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -544,8 +562,8 @@ app.post('/api/transactions', requireAuth, loadUser, requireRole('customer'), as
     }
     created = transactionResult.rows[0];
     await client.query(
-      'INSERT INTO fraud_logs (transaction_id, risk_score, flag_reason) VALUES ($1, $2, $3)',
-      [created.transaction_id, riskScore, flagReason],
+      'INSERT INTO fraud_logs (transaction_id, risk_score, flag_reason, ai_summary) VALUES ($1, $2, $3, $4)',
+      [created.transaction_id, analysis.score, analysis.reason, analysis.summary],
     );
     if (!mustReview) {
       await client.query('UPDATE accounts SET balance = balance - $1, updated_at = now() WHERE account_id = $2', [amount, sender.account_id]);
@@ -556,7 +574,12 @@ app.post('/api/transactions', requireAuth, loadUser, requireRole('customer'), as
       [request.user.user_id, 'transaction_created', 'transaction', created.transaction_id],
     );
     await client.query('COMMIT');
-    created = { ...created, risk_score: riskScore, flag_reason: flagReason };
+    created = {
+      ...created,
+      risk_score: analysis.score,
+      flag_reason: analysis.reason,
+      ai_summary: analysis.summary,
+    };
   } catch (error) {
     await client.query('ROLLBACK').catch((rollbackError) => console.error('Transaction rollback failed:', rollbackError));
     throw error;

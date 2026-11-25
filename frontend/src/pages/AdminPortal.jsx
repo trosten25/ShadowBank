@@ -56,7 +56,7 @@ export default function AdminPortal() {
 
       {tab === 'Threat review' && (
         <Panel>
-          <div className="mb-5"><h2 className="font-semibold">Threat review queue</h2><p className="mt-1 text-xs text-slate-500">Approve a held transaction to apply its balance changes, or decline it with no balance movement.</p></div>
+          <div className="mb-5"><h2 className="font-semibold">Threat review queue</h2><p className="mt-1 text-xs text-slate-500">Review the behavioral score and signals. Approve a held transaction to apply its balance changes, or decline it with no balance movement. A score is a review signal, not proof of fraud.</p></div>
           <ReviewQueue transactions={reviewItems} customers={customers} onReview={reviewTransaction} />
           {!reviewItems.length && <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] p-5 text-center text-sm text-emerald-200">The review queue is clear.</div>}
         </Panel>
